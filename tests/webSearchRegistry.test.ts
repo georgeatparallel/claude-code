@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -8,17 +8,25 @@ test('the production registry selects WebSearch and respects deny, simple mode a
   // out of this check. Registry, permission matcher, tool and MCP SDK are real.
   const configDir = await mkdtemp(join(tmpdir(), 'claude-web-search-registry-'))
   try {
+    await writeFile(join(configDir, 'client-cert.pem'), 'fixture-client-cert')
+    await writeFile(join(configDir, 'client-key.pem'), 'fixture-client-key')
     const child = Bun.spawn([process.execPath, '--preload', './plugins/bunBundleDev.ts', '--eval', `
       const { getTools } = await import('./src/tools.ts')
       const { getEmptyToolPermissionContext } = await import('./src/Tool.ts')
       const { WebSearchTool } = await import('./src/tools/WebSearchTool/WebSearchTool.ts')
+      const { setSessionSettingsCache } = await import('./src/utils/settings/settingsCache.ts')
+      const { setMcpServerEnabled, doesEnterpriseMcpConfigExist } = await import('./src/services/mcp/config.ts')
+      const { getManagedFilePath } = await import('./src/utils/settings/managedPath.ts')
+      const { disableKeepAlive } = await import('./src/utils/proxy.ts')
+      disableKeepAlive()
       const context = getEmptyToolPermissionContext()
       const selected = getTools(context).find(tool => tool.name === 'WebSearch')
       const requests = []
       globalThis.fetch = async (url, init = {}) => {
         const body = init.body ? JSON.parse(String(init.body)) : undefined
         const headers = new Headers(init.headers)
-        requests.push({ url: String(url), ua: headers.get('user-agent'), auth: headers.has('authorization'), method: body?.method })
+        requests.push({ url: String(url), ua: headers.get('user-agent'), auth: headers.has('authorization'), method: body?.method,
+          proxy: init.proxy, unix: init.unix, cert: init.tls?.cert, key: init.tls?.key, keepalive: init.keepalive })
         if (!body || body.id === undefined) return new Response(null, { status: 202 })
         const result = body.method === 'initialize'
           ? { protocolVersion: body.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'registry-fixture', version: '1' } }
@@ -33,6 +41,38 @@ test('the production registry selects WebSearch and respects deny, simple mode a
       if (!validation.result) throw new Error(validation.message)
       const { data } = await selected.call(input, caller)
       const formatted = selected.mapToolResultToToolResultBlockParam(data, 'registry-search')
+      async function blocksWithoutRequests(settings) {
+        setSessionSettingsCache({ settings, errors: [] })
+        const before = requests.length
+        const rejected = !(await selected.validateInput(input, caller)).result
+        let directCallRejected = false
+        try { await selected.call(input, caller) } catch { directCallRejected = true }
+        return rejected && directCallRejected && requests.length === before
+      }
+      const emptyAllowlistBlocked = await blocksWithoutRequests({ allowedMcpServers: [] })
+      const urlDenyBlocked = await blocksWithoutRequests({ deniedMcpServers: [{ serverUrl: 'https://search.parallel.ai/mcp' }] })
+      const nameDenyBlocked = await blocksWithoutRequests({ deniedMcpServers: [{ serverName: 'parallel-search' }] })
+      setSessionSettingsCache({ settings: { allowedMcpServers: [{ serverUrl: 'https://search.parallel.ai/mcp' }] }, errors: [] })
+      const explicitUrlAllowed = (await selected.validateInput(input, caller)).result
+      const allowedStart = requests.length
+      await selected.call(input, caller)
+      const explicitUrlExecuted = explicitUrlAllowed && requests.length > allowedStart
+      setMcpServerEnabled('parallel-search', false)
+      const disabledServerBlocked = await blocksWithoutRequests({})
+      setMcpServerEnabled('parallel-search', true)
+      process.env.USER_TYPE = 'ant'
+      process.env.CLAUDE_CODE_MANAGED_SETTINGS_PATH = process.env.CLAUDE_CONFIG_DIR
+      getManagedFilePath.cache.clear()
+      doesEnterpriseMcpConfigExist.cache.clear()
+      const { writeFile, rm } = await import('node:fs/promises')
+      const managedFile = process.env.CLAUDE_CONFIG_DIR + '/managed-mcp.json'
+      await writeFile(managedFile, JSON.stringify({ mcpServers: {} }))
+      const enterpriseConfigBlocked = await blocksWithoutRequests({})
+      await rm(managedFile)
+      process.env.USER_TYPE = 'external'
+      delete process.env.CLAUDE_CODE_MANAGED_SETTINGS_PATH
+      getManagedFilePath.cache.clear()
+      doesEnterpriseMcpConfigExist.cache.clear()
       const denied = getEmptyToolPermissionContext()
       denied.alwaysDenyRules.session = ['WebSearch']
       const denyRemoved = !getTools(denied).some(tool => tool.name === 'WebSearch')
@@ -43,7 +83,7 @@ test('the production registry selects WebSearch and respects deny, simple mode a
       const parallelBedrock = getTools(context).includes(WebSearchTool)
       process.env.CLAUDE_CODE_WEB_SEARCH_PROVIDER = 'anthropic'
       const nativeBedrockRemoved = !getTools(context).some(tool => tool.name === 'WebSearch')
-      console.log(JSON.stringify({ actualTool: selected === WebSearchTool, denyRemoved, simpleRemoved, parallelBedrock, nativeBedrockRemoved, content: formatted.content, requests }))
+      console.log(JSON.stringify({ actualTool: selected === WebSearchTool, denyRemoved, simpleRemoved, parallelBedrock, nativeBedrockRemoved, emptyAllowlistBlocked, urlDenyBlocked, nameDenyBlocked, explicitUrlExecuted, disabledServerBlocked, enterpriseConfigBlocked, content: formatted.content, requests }))
     `], {
       cwd: new URL('..', import.meta.url).pathname,
       env: {
@@ -55,6 +95,10 @@ test('the production registry selects WebSearch and respects deny, simple mode a
         CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0',
         ANTHROPIC_MODEL: 'claude-sonnet-4-20250514', ANTHROPIC_API_KEY: '',
         ANTHROPIC_AUTH_TOKEN: '', CLAUDE_CODE_OAUTH_TOKEN: '', PARALLEL_API_KEY: '',
+        https_proxy: '', http_proxy: '', HTTP_PROXY: '', HTTPS_PROXY: 'http://proxy.fixture.invalid:8080',
+        ANTHROPIC_UNIX_SOCKET: '/tmp/anthropic-fixture.sock',
+        CLAUDE_CODE_CLIENT_CERT: join(configDir, 'client-cert.pem'),
+        CLAUDE_CODE_CLIENT_KEY: join(configDir, 'client-key.pem'),
       },
       stdout: 'pipe', stderr: 'pipe',
     })
@@ -63,7 +107,8 @@ test('the production registry selects WebSearch and respects deny, simple mode a
     ])
     expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
     const result = JSON.parse(stdout)
-    for (const key of ['actualTool', 'denyRemoved', 'simpleRemoved', 'parallelBedrock', 'nativeBedrockRemoved']) {
+    for (const key of ['actualTool', 'denyRemoved', 'simpleRemoved', 'parallelBedrock', 'nativeBedrockRemoved',
+      'emptyAllowlistBlocked', 'urlDenyBlocked', 'nameDenyBlocked', 'explicitUrlExecuted', 'disabledServerBlocked', 'enterpriseConfigBlocked']) {
       expect(result[key]).toBe(true)
     }
     expect(result.content).toContain('https://bun.sh/docs')
@@ -74,6 +119,11 @@ test('the production registry selects WebSearch and respects deny, simple mode a
       expect(request.url).toBe('https://search.parallel.ai/mcp')
       expect(request.ua).toContain('claude-code')
       expect(request.auth).toBe(false)
+      expect(request.proxy).toBe('http://proxy.fixture.invalid:8080')
+      expect(request.unix).toBeUndefined()
+      expect(request.cert).toBe('fixture-client-cert')
+      expect(request.key).toBe('fixture-client-key')
+      expect(request.keepalive).toBe(false)
     }
   } finally {
     await rm(configDir, { recursive: true, force: true })

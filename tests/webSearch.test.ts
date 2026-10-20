@@ -2,8 +2,11 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:
 import { getSessionId, regenerateSessionId } from '../src/bootstrap/state.js'
 
 // Keep the production tool, resolver, MCP SDK, session lifecycle and result
-// formatter. Only the unrelated UI, telemetry and Anthropic model are fixtures.
+// formatter. Unrelated UI, telemetry, the Anthropic model and an unrestricted
+// MCP policy and proxy configuration are fixtures. webSearchRegistry.test.ts
+// checks real policy denial and configured network options.
 let anthropicCalls = 0
+let proxyOptionsFixture: RequestInit = {}
 mock.module('../src/services/analytics/growthbook.js', () => ({
   getFeatureValue_CACHED_MAY_BE_STALE: () => false,
 }))
@@ -28,18 +31,26 @@ mock.module('../src/utils/model/model.js', () => ({
 mock.module('../src/utils/slowOperations.js', () => ({
   jsonParse: JSON.parse, jsonStringify: JSON.stringify,
 }))
+mock.module('../src/services/mcp/config.js', () => ({
+  filterMcpServersByPolicy: (configs: unknown) => ({ allowed: configs, blocked: [] }),
+  isMcpServerDisabled: () => false,
+  doesEnterpriseMcpConfigExist: () => false,
+}))
+mock.module('../src/utils/proxy.js', () => ({
+  getProxyFetchOptions: () => proxyOptionsFixture,
+}))
 
 const { WebSearchTool } = await import('../src/tools/WebSearchTool/WebSearchTool.js')
 const originalFetch = globalThis.fetch
 const originalEnv = { ...process.env }
-type RequestRecord = { url: string; headers: Headers; body: any }
+type RequestRecord = { url: string; headers: Headers; body: any; options?: RequestInit }
 let requests: RequestRecord[] = []
 let mode = 'success'
 
 function installServerFixture() {
   globalThis.fetch = (async (url: any, init: RequestInit = {}) => {
     const body = init.body ? JSON.parse(String(init.body)) : undefined
-    requests.push({ url: String(url), headers: new Headers(init.headers), body })
+    requests.push({ url: String(url), headers: new Headers(init.headers), body, options: init })
     if (init.signal?.aborted) throw init.signal.reason
     if (mode === 'hang' || (mode === 'hang-search' && body?.method === 'tools/call')) {
       return await new Promise<Response>((_resolve, reject) => {
@@ -90,7 +101,7 @@ async function search(query = 'Bun runtime documentation', ctx = context(), extr
 }
 
 beforeEach(() => {
-  requests = []; anthropicCalls = 0; mode = 'success'
+  requests = []; anthropicCalls = 0; mode = 'success'; proxyOptionsFixture = {}
   for (const key of ['CLAUDE_CODE_WEB_SEARCH_PROVIDER', 'ANTHROPIC_API_KEY',
     'ANTHROPIC_AUTH_TOKEN', 'PARALLEL_API_KEY', 'CLAUDE_CODE_USE_BEDROCK',
     'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) delete process.env[key]
@@ -127,6 +138,21 @@ describe('WebSearch runtime caller with the real MCP SDK', () => {
     process.env.PARALLEL_API_KEY = 'fixture-parallel-key'
     await search()
     for (const r of requests) expect(JSON.stringify(r.body) + [...r.headers].join()).not.toContain('fixture-')
+  })
+
+  test('configured network options reach every owned MCP request', async () => {
+    proxyOptionsFixture = {
+      proxy: 'http://proxy.example:8080',
+      tls: { cert: 'fixture-cert', key: 'fixture-key' },
+      keepalive: false,
+    } as RequestInit
+    await search()
+    for (const r of requests) {
+      expect((r.options as any).proxy).toBe('http://proxy.example:8080')
+      expect((r.options as any).tls).toEqual({ cert: 'fixture-cert', key: 'fixture-key' })
+      expect(r.options!.keepalive).toBe(false)
+      expect(r.options!.redirect).toBe('error')
+    }
   })
 
   test('explicit Anthropic selection uses the original provider and result contract', async () => {

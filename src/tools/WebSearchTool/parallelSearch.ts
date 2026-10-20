@@ -4,7 +4,8 @@ import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js'
 import { createHash } from 'crypto'
 import type { Output, SearchResult } from './WebSearchTool.js'
 
-const PARALLEL_SEARCH_URL = 'https://search.parallel.ai/mcp'
+export const PARALLEL_SEARCH_SERVER_NAME = 'parallel-search'
+export const PARALLEL_SEARCH_URL = 'https://search.parallel.ai/mcp'
 const PARALLEL_SEARCH_USER_AGENT =
   'claude-code/parallel-search (+https://github.com/tanbiralam/claude-code)'
 const PARALLEL_SEARCH_TIMEOUT_MS = 60_000
@@ -75,11 +76,13 @@ export async function runParallelSearch({
   sessionId,
   agentId,
   signal: callerSignal,
+  fetchOptions,
 }: {
   query: string
   sessionId: string
   agentId?: string
   signal: AbortSignal
+  fetchOptions?: RequestInit
 }): Promise<Output> {
   const startTime = performance.now()
   // These are opaque runtime identities, not user text or credentials. An agent
@@ -102,6 +105,7 @@ export async function runParallelSearch({
         headers.set('User-Agent', PARALLEL_SEARCH_USER_AGENT)
         return fetch(url, {
           ...init,
+          ...fetchOptions,
           headers,
           redirect: 'error',
           signal: init?.signal

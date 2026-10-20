@@ -8,15 +8,26 @@ import { z } from 'zod/v4'
 import { getSessionId } from '../../bootstrap/state.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
 import { queryModelWithStreaming } from '../../services/api/claude.js'
+import {
+  doesEnterpriseMcpConfigExist,
+  filterMcpServersByPolicy,
+  isMcpServerDisabled,
+} from '../../services/mcp/config.js'
 import { buildTool, type ToolDef } from '../../Tool.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { logError } from '../../utils/log.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { getMainLoopModel, getSmallFastModel } from '../../utils/model/model.js'
+import { getProxyFetchOptions } from '../../utils/proxy.js'
 import { jsonParse, jsonStringify } from '../../utils/slowOperations.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { getWebSearchPrompt, WEB_SEARCH_TOOL_NAME } from './prompt.js'
-import { resolveWebSearchProvider, runParallelSearch } from './parallelSearch.js'
+import {
+  PARALLEL_SEARCH_SERVER_NAME,
+  PARALLEL_SEARCH_URL,
+  resolveWebSearchProvider,
+  runParallelSearch,
+} from './parallelSearch.js'
 import {
   getToolUseSummary,
   renderToolResultMessage,
@@ -163,6 +174,23 @@ function isAnthropicSearchEnabled(): boolean {
   )
 }
 
+function assertParallelSearchAllowed(): void {
+  if (doesEnterpriseMcpConfigExist()) {
+    throw new Error(
+      'Managed MCP configuration controls available servers. Use the configured MCP tools instead of built-in Parallel search.',
+    )
+  }
+  if (isMcpServerDisabled(PARALLEL_SEARCH_SERVER_NAME)) {
+    throw new Error('Parallel web search is disabled in this project.')
+  }
+  const { allowed } = filterMcpServersByPolicy({
+    [PARALLEL_SEARCH_SERVER_NAME]: { type: 'http', url: PARALLEL_SEARCH_URL },
+  })
+  if (!allowed[PARALLEL_SEARCH_SERVER_NAME]) {
+    throw new Error('Parallel web search is blocked by MCP server policy.')
+  }
+}
+
 export const WebSearchTool = buildTool({
   name: WEB_SEARCH_TOOL_NAME,
   searchHint: 'search the web for current information',
@@ -244,6 +272,9 @@ export const WebSearchTool = buildTool({
       }
     }
     try {
+      if (resolveWebSearchProvider(input) === 'parallel') {
+        assertParallelSearchAllowed()
+      }
       if (
         resolveWebSearchProvider(input) === 'anthropic' &&
         !isAnthropicSearchEnabled()
@@ -267,6 +298,7 @@ export const WebSearchTool = buildTool({
     const startTime = performance.now()
     const { query } = input
     if (resolveWebSearchProvider(input) === 'parallel') {
+      assertParallelSearchAllowed()
       // Capture the conversation before any asynchronous work or session switch.
       const sessionId = getSessionId()
       const agentId = context.agentId
@@ -275,6 +307,7 @@ export const WebSearchTool = buildTool({
         sessionId,
         agentId,
         signal: context.abortController.signal,
+        fetchOptions: getProxyFetchOptions(),
       })
       return { data }
     }

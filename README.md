@@ -65,7 +65,10 @@ bun run start -- -p "Hello Claude"
 The built-in `WebSearch` tool uses [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
 for searches without domain filters. Search runs in Fast mode through the anonymous
 endpoint, with no Parallel account or search API key required. Existing `WebSearch`
-permission rules still apply. Search errors are returned without trying another
+permission rules and MCP allowlists, denylists and disabled-server settings still
+apply (server name: `parallel-search`). The built-in connection is unavailable when
+`managed-mcp.json` exclusively controls MCP servers; use the configured MCP tools
+or select Anthropic search in that case. Search errors are returned without trying another
 provider; requests time out after 60 seconds and stop when the conversation is cancelled.
 
 Set `CLAUDE_CODE_WEB_SEARCH_PROVIDER=anthropic` to keep using the original Anthropic
