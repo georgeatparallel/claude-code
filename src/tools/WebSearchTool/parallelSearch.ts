@@ -32,7 +32,7 @@ export function resolveWebSearchProvider(input: SearchInput = {}):
     }
     return 'anthropic'
   }
-  return configured || 'parallel'
+  return configured === 'anthropic' ? 'anthropic' : 'parallel'
 }
 
 function httpUrl(value: unknown): value is string {
