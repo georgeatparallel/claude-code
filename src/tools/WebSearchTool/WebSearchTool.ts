@@ -5,6 +5,7 @@ import type {
 import { getAPIProvider } from 'src/utils/model/providers.js'
 import type { PermissionResult } from 'src/utils/permissions/PermissionResult.js'
 import { z } from 'zod/v4'
+import { getSessionId } from '../../bootstrap/state.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
 import { queryModelWithStreaming } from '../../services/api/claude.js'
 import { buildTool, type ToolDef } from '../../Tool.js'
@@ -15,6 +16,7 @@ import { getMainLoopModel, getSmallFastModel } from '../../utils/model/model.js'
 import { jsonParse, jsonStringify } from '../../utils/slowOperations.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { getWebSearchPrompt, WEB_SEARCH_TOOL_NAME } from './prompt.js'
+import { resolveWebSearchProvider, runParallelSearch } from './parallelSearch.js'
 import {
   getToolUseSummary,
   renderToolResultMessage,
@@ -149,6 +151,18 @@ function makeOutputFromSearchResponse(
   }
 }
 
+function isAnthropicSearchEnabled(): boolean {
+  const provider = getAPIProvider()
+  const model = getMainLoopModel()
+  if (provider === 'firstParty' || provider === 'foundry') return true
+  return (
+    provider === 'vertex' &&
+    (model.includes('claude-opus-4') ||
+      model.includes('claude-sonnet-4') ||
+      model.includes('claude-haiku-4'))
+  )
+}
+
 export const WebSearchTool = buildTool({
   name: WEB_SEARCH_TOOL_NAME,
   searchHint: 'search the web for current information',
@@ -166,30 +180,10 @@ export const WebSearchTool = buildTool({
     return summary ? `Searching for ${summary}` : 'Searching the web'
   },
   isEnabled() {
-    const provider = getAPIProvider()
-    const model = getMainLoopModel()
-
-    // Enable for firstParty
-    if (provider === 'firstParty') {
-      return true
-    }
-
-    // Enable for Vertex AI with supported models (Claude 4.0+)
-    if (provider === 'vertex') {
-      const supportsWebSearch =
-        model.includes('claude-opus-4') ||
-        model.includes('claude-sonnet-4') ||
-        model.includes('claude-haiku-4')
-
-      return supportsWebSearch
-    }
-
-    // Foundry only ships models that already support Web Search
-    if (provider === 'foundry') {
-      return true
-    }
-
-    return false
+    // An invalid setting is reported by validateInput rather than hiding the tool.
+    return process.env.CLAUDE_CODE_WEB_SEARCH_PROVIDER === 'anthropic'
+      ? isAnthropicSearchEnabled()
+      : true
   },
   get inputSchema(): InputSchema {
     return inputSchema()
@@ -249,11 +243,44 @@ export const WebSearchTool = buildTool({
         errorCode: 2,
       }
     }
+    try {
+      if (
+        resolveWebSearchProvider(input) === 'anthropic' &&
+        !isAnthropicSearchEnabled()
+      ) {
+        return {
+          result: false,
+          message: 'Anthropic web search is not available for this model provider. Remove domain filters to use Parallel search.',
+          errorCode: 3,
+        }
+      }
+    } catch (error) {
+      return {
+        result: false,
+        message: error instanceof Error ? error.message : String(error),
+        errorCode: 4,
+      }
+    }
     return { result: true }
   },
   async call(input, context, _canUseTool, _parentMessage, onProgress) {
     const startTime = performance.now()
     const { query } = input
+    if (resolveWebSearchProvider(input) === 'parallel') {
+      // Capture the conversation before any asynchronous work or session switch.
+      const sessionId = getSessionId()
+      const agentId = context.agentId
+      const data = await runParallelSearch({
+        query,
+        sessionId,
+        agentId,
+        signal: context.abortController.signal,
+      })
+      return { data }
+    }
+    if (!isAnthropicSearchEnabled()) {
+      throw new Error('Anthropic web search is not available for this model provider.')
+    }
     const userMessage = createUserMessage({
       content: 'Perform a web search for the query: ' + query,
     })
